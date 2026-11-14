@@ -471,7 +471,11 @@ final class SourcesViewController: SileoViewController {
             self.dismiss(animated: true, completion: nil)
             if let repoURL = alert?.textFields?[0].text,
                 let url = URL(string: repoURL) {
-                self.handleSourceAdd(urls: [url], bypassFlagCheck: false)
+                if GitHubInstaller.isGitHubLink(url) {
+                    GitHubInstaller.install(from: url, presenter: self)
+                } else {
+                    self.handleSourceAdd(urls: [url], bypassFlagCheck: false)
+                }
             }
         })
         alert.addAction(addAction)
@@ -869,5 +873,188 @@ extension SourcesViewController: UIViewControllerPreviewingDelegate {
     func previewingContext(_ previewingContext: UIViewControllerPreviewing, commit viewControllerToCommit: UIViewController) {
         let navController = SileoNavigationController(rootViewController: viewControllerToCommit)
         self.splitViewController?.showDetailViewController(navController, sender: self)
+    }
+}
+
+
+//
+//  GitHubInstaller.swift
+//  Sileo
+
+import UIKit
+
+enum GitHubInstaller {
+
+    struct Release: Decodable {
+        let tagName: String
+        let name: String?
+        let prerelease: Bool
+        let draft: Bool
+        let assets: [Asset]
+
+        enum CodingKeys: String, CodingKey {
+            case tagName = "tag_name"
+            case name, prerelease, draft, assets
+        }
+    }
+
+    struct Asset: Decodable {
+        let name: String
+        let size: Int
+        let browserDownloadURL: URL
+
+        enum CodingKeys: String, CodingKey {
+            case name, size
+            case browserDownloadURL = "browser_download_url"
+        }
+    }
+
+    enum InstallError: LocalizedError {
+        case badLink, noRelease, noDeb, http(Int)
+
+        var errorDescription: String? {
+            switch self {
+            case .badLink: return "Lien GitHub invalide (attendu : https://github.com/user/repo)"
+            case .noRelease: return "Aucune release trouvée pour ce dépôt"
+            case .noDeb: return "Aucun .deb dans la dernière release"
+            case .http(let code): return "Erreur GitHub (HTTP \(code)). Limite de requêtes atteinte ?"
+            }
+        }
+    }
+
+    // MARK: - Parsing du lien
+
+    static func isGitHubLink(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host == "github.com" || host == "www.github.com"
+    }
+
+    static func ownerAndRepo(from url: URL) -> (String, String)? {
+        let parts = url.pathComponents.filter { $0 != "/" }
+        guard isGitHubLink(url), parts.count >= 2 else { return nil }
+        var repo = parts[1]
+        if repo.hasSuffix(".git") { repo.removeLast(4) }
+        return (parts[0], repo)
+    }
+
+    // MARK: - Choix de l'asset
+
+    /// Score un nom de .deb selon le jailbreak actuel (rootless / rootful / roothide).
+    private static func score(_ name: String) -> Int {
+        let n = name.lowercased()
+        guard n.hasSuffix(".deb") else { return -1 }
+        let rootless = DpkgWrapper.architecture.primary == .rootless
+        let isRoothide = n.contains("roothide")
+        let isRootlessName = n.contains("arm64") && !n.contains("arm64e") || n.contains("rootless")
+        let isRootfulName = n.contains("iphoneos-arm_") || n.contains("rootful") || n.contains("_arm.deb")
+
+        if rootless {
+            if isRoothide { return 1 }
+            if isRootlessName { return 3 }
+            if isRootfulName { return 0 }
+            return 2 // nom neutre : on tente
+        } else {
+            if isRootfulName { return 3 }
+            if isRootlessName || isRoothide { return 0 }
+            return 2
+        }
+    }
+
+    static func bestAsset(in release: Release) -> Asset? {
+        release.assets
+            .map { ($0, score($0.name)) }
+            .filter { $0.1 >= 0 }
+            .sorted { $0.1 > $1.1 }
+            .first?.0
+    }
+
+    // MARK: - Réseau
+
+    static func latestRelease(owner: String, repo: String,
+                              token: String? = UserDefaults.standard.string(forKey: "GitHubToken"),
+                              completion: @escaping (Result<Release, Error>) -> Void) {
+        guard let url = URL(string: "https://api.github.com/repos/\(owner)/\(repo)/releases?per_page=10") else {
+            return completion(.failure(InstallError.badLink))
+        }
+        var request = URLRequest(url: url)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        if let token = token, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error { return completion(.failure(error)) }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                return completion(.failure(InstallError.http(http.statusCode)))
+            }
+            guard let data = data,
+                  let releases = try? JSONDecoder().decode([Release].self, from: data) else {
+                return completion(.failure(InstallError.noRelease))
+            }
+            // Dernière release stable qui contient au moins un .deb
+            let match = releases.first { !$0.draft && !$0.prerelease && bestAsset(in: $0) != nil }
+                ?? releases.first { !$0.draft && bestAsset(in: $0) != nil }
+            if let match = match {
+                completion(.success(match))
+            } else {
+                completion(.failure(releases.isEmpty ? InstallError.noRelease : InstallError.noDeb))
+            }
+        }.resume()
+    }
+
+    static func download(_ asset: Asset, completion: @escaping (Result<URL, Error>) -> Void) {
+        URLSession.shared.downloadTask(with: asset.browserDownloadURL) { tmp, response, error in
+            if let error = error { return completion(.failure(error)) }
+            guard let tmp = tmp else { return completion(.failure(InstallError.noDeb)) }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                return completion(.failure(InstallError.http(http.statusCode)))
+            }
+            let dest = FileManager.default.temporaryDirectory.appendingPathComponent(asset.name)
+            try? FileManager.default.removeItem(at: dest)
+            do {
+                try FileManager.default.moveItem(at: tmp, to: dest)
+                completion(.success(dest))
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    // MARK: - Flux complet
+
+    /// Appelé depuis l'écran Sources quand l'utilisateur colle un lien github.com.
+    static func install(from link: URL, presenter: UIViewController) {
+        guard let (owner, repo) = ownerAndRepo(from: link) else {
+            return show(InstallError.badLink, on: presenter)
+        }
+        latestRelease(owner: owner, repo: repo) { result in
+            switch result {
+            case .failure(let error):
+                DispatchQueue.main.async { show(error, on: presenter) }
+            case .success(let release):
+                guard let asset = bestAsset(in: release) else {
+                    return DispatchQueue.main.async { show(InstallError.noDeb, on: presenter) }
+                }
+                download(asset) { dl in
+                    DispatchQueue.main.async {
+                        switch dl {
+                        case .failure(let error):
+                            show(error, on: presenter)
+                        case .success(let file):
+                            // Même chemin qu'un .deb ouvert depuis Fichiers.
+                            let app = UIApplication.shared
+                            _ = app.delegate?.application?(app, open: file, options: [:])
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static func show(_ error: Error, on vc: UIViewController) {
+        let alert = UIAlertController(title: "GitHub",
+                                      message: error.localizedDescription,
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+        vc.present(alert, animated: true)
     }
 }
