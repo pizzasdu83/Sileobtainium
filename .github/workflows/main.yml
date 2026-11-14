@@ -24,11 +24,22 @@ jobs:
       - name: Install tools
         run: brew install ldid dpkg xz
 
-      - name: Build (iphoneos-arm, rootful)
-        run: make clean package NIGHTLY=1 DEBUG=0 ALL_BOOTSTRAPS=1
-
-      - name: Build (iphoneos-arm64, rootless)
-        run: make clean package NIGHTLY=1 DEBUG=0 ALL_BOOTSTRAPS=1 SILEO_PLATFORM=iphoneos-arm64
+      # Alderis (color picker) déclare une propriété `tab` qui entre en conflit
+      # avec UIViewController.tab ajouté dans le SDK iOS 18. On la renomme dans
+      # les sources téléchargées par SwiftPM avant de compiler.
+      - name: Build (rootful + rootless)
+        run: |
+          build() {
+            make clean
+            xcodebuild -resolvePackageDependencies -project Sileo.xcodeproj -scheme Sileo -derivedDataPath "$TMPDIR/sileo"
+            F="$TMPDIR/sileo/SourcePackages/checkouts/Alderis/Alderis/ColorPickerInnerViewController.swift"
+            sed -i '' 's/var tab: ColorPickerTab {/var pickerTab: ColorPickerTab {/' "$F"
+            sed -i '' 's/^\([[:space:]]*\)tab = configuration.initialTab/\1pickerTab = configuration.initialTab/' "$F"
+            grep -n "pickerTab" "$F"
+            make package NIGHTLY=1 DEBUG=0 ALL_BOOTSTRAPS=1 "$@"
+          }
+          build
+          build SILEO_PLATFORM=iphoneos-arm64
 
       - name: Upload debs
         uses: actions/upload-artifact@v4
