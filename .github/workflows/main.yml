@@ -24,6 +24,13 @@ jobs:
       - name: Install tools
         run: brew install ldid dpkg xz
 
+      # Evander (dépendance) demande iOS 12 minimum, alors que le projet vise
+      # iOS 11 : Xcode 26 refuse. On passe la cible à 12.0.
+      - name: Bump deployment target
+        run: |
+          sed -i '' 's/IPHONEOS_DEPLOYMENT_TARGET = 11.0;/IPHONEOS_DEPLOYMENT_TARGET = 12.0;/' Sileo.xcodeproj/project.pbxproj
+          grep -c "IPHONEOS_DEPLOYMENT_TARGET = 12.0;" Sileo.xcodeproj/project.pbxproj
+
       # Alderis (color picker) déclare une propriété `tab` qui entre en conflit
       # avec UIViewController.tab ajouté dans le SDK iOS 18. On la renomme dans
       # les sources téléchargées par SwiftPM avant de compiler.
